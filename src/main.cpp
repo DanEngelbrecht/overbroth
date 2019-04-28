@@ -101,6 +101,7 @@ struct Work
     uint32_t m_EndY;
     uint8_t* m_Output;
     uint32_t m_ScanlineWidth;
+    uint8_t m_Priority;
 };
 
 struct NadirLock
@@ -150,10 +151,11 @@ struct NodeWorker
     {
     }
 
-    bool CreateThread(Bikeshed in_shed, nadir::HConditionVariable in_condition_variable, nadir::TAtomic32* in_stop)
+    bool CreateThread(Bikeshed in_shed, nadir::HConditionVariable in_condition_variable, uint8_t in_channel_count, nadir::TAtomic32* in_stop)
     {
         shed               = in_shed;
         stop               = in_stop;
+        channel_count      = in_channel_count;
         condition_variable = in_condition_variable;
         thread             = nadir::CreateThread(malloc(nadir::GetThreadSize()), NodeWorker::Execute, 0, this);
         return thread != 0;
@@ -169,17 +171,25 @@ struct NodeWorker
     {
         NodeWorker* _this = (NodeWorker*)context;
 
-        Bikeshed_TaskID next_ready_task = 0;
-        while (*_this->stop == 0)
+        while (1)
         {
-            if (next_ready_task != 0)
+            uint8_t c = 0;
+            while (c < _this->channel_count && *_this->stop == 0)
             {
-                Bikeshed_ExecuteAndResolve(_this->shed, next_ready_task, &next_ready_task);
-                continue;
+                if (Bikeshed_ExecuteOne(_this->shed, c))
+                {
+                    c = 0;
+                    continue;
+                }
+                c++;
             }
-            if (!Bikeshed_ExecuteOne(_this->shed, &next_ready_task))
+            if (*_this->stop == 0)
             {
                 nadir::SleepConditionVariable(_this->condition_variable, 1000);
+            }
+            else
+            {
+                break;
             }
         }
         return 0;
@@ -189,13 +199,15 @@ struct NodeWorker
     Bikeshed                    shed;
     nadir::HConditionVariable   condition_variable;
     nadir::HThread              thread;
+    uint8_t                     channel_count;
 };
 
 static nadir::TAtomic32 gFrameIndex = 0;
 static long gPeakActiveCount = 0;
 
+#define PRIORITY_LEVELS 64
 
-static void DoArea(Work* work, Bikeshed_TaskID task_id, uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2, void** sub_work_data, uint16_t* sub_work_count)
+static void DoArea(Work* work, Bikeshed_TaskID , uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2, void** sub_work_data, uint16_t* sub_work_count)
 {
     uint32_t next_max_iterations = work->m_MaxIterationsForBlock * 2;
     if (next_max_iterations > work->m_MaxIterationsToStop)
@@ -233,9 +245,8 @@ static void DoArea(Work* work, Bikeshed_TaskID task_id, uint32_t x1, uint32_t y1
             {
                 if (work->m_MaxIterationsForBlock != work->m_MaxIterationsToStop)
                 {
-                    uint8_t r = (uint8_t)(task_id & 0xff);
-                    uint8_t g = (uint8_t)((task_id >> 8) & 0xff);
-                    uint8_t b = 255u - (uint8_t)((task_id >> 16) & 0xff);
+                    uint8_t temp_pixel[3];
+                    map_color(work->m_MaxIterationsForBlock, work->m_MaxIterationsToStop, v2, u2, temp_pixel);
                     for (y = y1; y < y2; ++y)
                     {
                         line_start = &work->m_Output[work->m_ScanlineWidth * y];
@@ -243,7 +254,7 @@ static void DoArea(Work* work, Bikeshed_TaskID task_id, uint32_t x1, uint32_t y1
                         for (x = x1; x < x2; ++x)
                         {
                             pixel = (uint8_t*)& line_start[sizeof(uint8_t) * 3 * x];
-                            SET_COL(pixel, r, g, b);
+                            SET_COL(pixel, temp_pixel[0], temp_pixel[1], temp_pixel[2]);
                         }
                     }
 
@@ -259,6 +270,7 @@ static void DoArea(Work* work, Bikeshed_TaskID task_id, uint32_t x1, uint32_t y1
                     subwork->m_EndX = x2;
                     subwork->m_EndY = y2;
                     subwork->m_MaxIterationsForBlock = next_max_iterations;
+                    subwork->m_Priority = work->m_Priority >= PRIORITY_LEVELS ? PRIORITY_LEVELS : work->m_Priority + 1;
                     sub_work_data[(*sub_work_count)++] = subwork;
 
                     return;
@@ -276,7 +288,7 @@ static void DoArea(Work* work, Bikeshed_TaskID task_id, uint32_t x1, uint32_t y1
     }
 }
 
-static Bikeshed_TaskResult Calculate(Bikeshed shed, Bikeshed_TaskID task_id, void* context_data)
+static Bikeshed_TaskResult Calculate(Bikeshed shed, Bikeshed_TaskID task_id, uint8_t , void* context_data)
 {
     Work* work = (Work*)context_data;
 
@@ -295,7 +307,7 @@ static Bikeshed_TaskResult Calculate(Bikeshed shed, Bikeshed_TaskID task_id, voi
     uint16_t sub_work_count = 0;
     uint32_t width = work->m_EndX - work->m_StartX;
     uint32_t height = work->m_EndY - work->m_StartY;
-    if (width < 4 || height < 4)
+    if (width < 2 || height < 2)
     {
         work->m_MaxIterationsForBlock = work->m_MaxIterationsToStop;
         DoArea(work, task_id, work->m_StartX, work->m_StartY, work->m_EndX, work->m_EndY, sub_work_data, &sub_work_count);
@@ -317,6 +329,8 @@ static Bikeshed_TaskResult Calculate(Bikeshed shed, Bikeshed_TaskID task_id, voi
         BikeShed_TaskFunc funcs[4] = {Calculate, Calculate, Calculate, Calculate};
         if (Bikeshed_CreateTasks(shed, sub_work_count, funcs, sub_work_data, sub_tasks))
         {
+            Work* first_sub_work = (Work*)sub_work_data[0];
+            Bikeshed_SetTasksChannel(shed, sub_work_count, sub_tasks, first_sub_work->m_Priority);
             Bikeshed_ReadyTasks(shed, sub_work_count, sub_tasks);
             nadir::AtomicAdd32(work->m_SubmittedWorkCount, sub_work_count);
             long active_count = nadir::AtomicAdd32(work->m_ActiveWorkCount, sub_work_count);
@@ -376,6 +390,7 @@ static void DivideWork(Bikeshed shed, Work* work)
     BikeShed_TaskFunc funcs[4] = {Calculate, Calculate, Calculate, Calculate};
     if (Bikeshed_CreateTasks(shed, 4, funcs, (void**)sub_work_data, sub_tasks))
     {
+        Bikeshed_SetTasksChannel(shed, 4, sub_tasks, work->m_Priority);
         Bikeshed_ReadyTasks(shed, 4, sub_tasks);
         nadir::AtomicAdd32(work->m_SubmittedWorkCount, 4);
         long active_count = nadir::AtomicAdd32(work->m_ActiveWorkCount, 4);
@@ -425,12 +440,12 @@ int main(int argc, char** argv)
     nadir::TAtomic32 stop = 0;
 
     uint32_t width = 1920u;
-    uint32_t height = 1080u;
+    uint32_t height = 1080u; 
 
     double x = -1.398995;//-1.2;// -1.398995;
     double y = 0.001901;//0.0;// 0.001901;
     double w = 0.0000035;//3.0;// 0.000005;
-    uint32_t i = 262144 * 2;
+    uint32_t i = 262144 / 2;
     uint32_t thread_count = 8;
 
     uint32_t ms_per_frame = 16;
@@ -452,7 +467,7 @@ int main(int argc, char** argv)
 
     printf("Generating: Image(%u,%u) Pos(%.6lf, %.6lf), Size(%.8lf) Iterations(%u), Threads(%u)\n", width, height, x, y, w, i, thread_count);
 
-    Bikeshed shed = Bikeshed_Create(malloc(Bikeshed_GetSize(65535, 65535)), 65535, 65535, &sync_primitive.m_ReadyCallback);
+    Bikeshed shed = Bikeshed_Create(malloc(BIKESHED_SIZE(524288, 0, PRIORITY_LEVELS)), 524288, 0, PRIORITY_LEVELS, &sync_primitive.m_ReadyCallback);
     if (shed == 0)
     {
         printf("Failed to create shed\n");
@@ -492,11 +507,12 @@ int main(int argc, char** argv)
     work->m_EndY = work->m_Height;
     work->m_ScanlineWidth = scanline_width;
     work->m_Output = output;
+    work->m_Priority = 0;
 
     NodeWorker* thread_context = new NodeWorker[thread_count];
     for (uint32_t t = 0; t < thread_count; ++t)
     {
-        if (!thread_context[t].CreateThread(shed, sync_primitive.m_ConditionVariable, &stop))
+        if (!thread_context[t].CreateThread(shed, sync_primitive.m_ConditionVariable, PRIORITY_LEVELS, &stop))
         {
             printf("Failed to create thread %u", t + 1);
             return -1;
@@ -509,20 +525,16 @@ int main(int argc, char** argv)
 
     free(work);
     work = 0;
+    void* p[8192];
+    uint32_t pc = 0;
 
     while (active_work_count > 0)
     {
-        if (ms_per_frame != 0)
+        if (ms_per_frame != 0 && pc < 8192)
         {
-            char filename[128];
-            sprintf(filename, "overbroth-%05ld.ppm", nadir::AtomicAdd32(&gFrameIndex, 1));
-            FILE* fp = fopen(filename, "wb"); /* b - binary mode */
-            if (fp)
-            {
-                (void)fprintf(fp, "P6\n%d %d\n255\n", width, height);
-                (void)fwrite(output, 3, width * height, fp);
-                (void)fclose(fp);
-            }
+            void* t = malloc(scanline_width * height);
+            memcpy(t, output, scanline_width * height);
+            p[pc++] = t;
             nadir::Sleep(ms_per_frame * 1000);    // 60 fps, roughly
         }
         else
@@ -535,6 +547,8 @@ int main(int argc, char** argv)
 
     uint64_t elapsed_tick = end_tick - start_tick;
     uint64_t elapsed_ms = (elapsed_tick * 1000) / GetTicksPerSecond();
+
+    printf("Threads: %u, Jobs submitted: %d. Peak active jobs: %d, Elapsed time: %.3f s\n", thread_count, (int)submitted_work_count, (int)gPeakActiveCount, (float)(elapsed_ms / 1000.f));
 
     nadir::AtomicAdd32(&stop, 1);
     nadir::WakeAll(sync_primitive.m_ConditionVariable);
@@ -549,19 +563,33 @@ int main(int argc, char** argv)
 
     free(shed);
 
+    printf("Writing %d images to disk\n", pc + 1);
+
     char filename[128];
-    sprintf(filename, "overbroth-%05ld.ppm", nadir::AtomicAdd32(&gFrameIndex, 1));
-    FILE* fp = fopen(filename, "wb"); /* b - binary mode */
-    if (fp)
     {
-        (void)fprintf(fp, "P6\n%d %d\n255\n", width, height);
-        (void)fwrite(output, 3, width * height, fp);
-        (void)fclose(fp);
+        sprintf(filename, "overbroth-%05ld.ppm", pc);
+        FILE* fp = fopen(filename, "wb"); /* b - binary mode */
+        if (fp)
+        {
+            (void)fprintf(fp, "P6\n%d %d\n255\n", width, height);
+            (void)fwrite(output, 3, width * height, fp);
+            (void)fclose(fp);
+        }
+        free(output);
     }
 
-    free(output);
-
-    printf("Threads: %u, Jobs submitted: %d. Peak active jobs: %d, Elapsed time: %.3f s", thread_count, (int)submitted_work_count, (int)gPeakActiveCount, (float)(elapsed_ms / 1000.f));
+    for (uint32_t pci = 0; pci < pc; ++pci)
+    {
+        sprintf(filename, "overbroth-%05ld.ppm", pci);
+        FILE* fp = fopen(filename, "wb"); /* b - binary mode */
+        if (fp)
+        {
+            (void)fprintf(fp, "P6\n%d %d\n255\n", width, height);
+            (void)fwrite(p[pci], 3, width * height, fp);
+            (void)fclose(fp);
+        }
+        free(p[pci]);
+    }
 
     return 0;
 }
