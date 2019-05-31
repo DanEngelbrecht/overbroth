@@ -12,6 +12,42 @@
 #    include <Windows.h>
 #endif
 
+namespace nadir
+{
+    typedef struct Semaphore* HSemaphore;
+    HSemaphore CreateSemaphore(unsigned int initial_count, unsigned int max_count);
+    void DestroySemaphore(HSemaphore semaphore);
+    bool PostSemaphore(HSemaphore semaphore, unsigned int count);
+    bool WaitSemaphore(HSemaphore semaphore);
+
+    HSemaphore CreateSemaphore(unsigned int initial_count, unsigned int max_count)
+    {
+        HANDLE handle = ::CreateSemaphore(NULL, initial_count, max_count, NULL);
+        if (handle == INVALID_HANDLE_VALUE)
+        {
+            return 0;
+        }
+        return (HSemaphore)handle;
+    }
+
+    void DestroySemaphore(HSemaphore semaphore)
+    {
+        ::CloseHandle((HANDLE)semaphore);
+    }
+
+    bool PostSemaphore(HSemaphore semaphore, unsigned int count)
+    {
+        return 0 != ::ReleaseSemaphore(
+                        (HANDLE)semaphore,
+                        count,
+                        NULL);
+    }
+
+    bool WaitSemaphore(HSemaphore semaphore)
+    {
+        return WAIT_OBJECT_0 == ::WaitForSingleObject((HANDLE)semaphore, 0);
+    }
+}
 
 #define H_COMPONENT 0
 #define S_COMPONENT 1
@@ -107,34 +143,21 @@ struct Work
 struct NadirLock
 {
     Bikeshed_ReadyCallback m_ReadyCallback;
-    NadirLock()
+    NadirLock(unsigned int max_count)
         : m_ReadyCallback { signal }
-        , m_Lock(nadir::CreateLock(malloc(nadir::GetNonReentrantLockSize())))
-        , m_ConditionVariable(nadir::CreateConditionVariable(malloc(nadir::GetConditionVariableSize()), m_Lock))
+        , m_Semaphore(nadir::CreateSemaphore(max_count, 0))
     {
     }
     ~NadirLock()
     {
-        nadir::DeleteConditionVariable(m_ConditionVariable);
-        free(m_ConditionVariable);
-        nadir::DeleteNonReentrantLock(m_Lock);
-        free(m_Lock);
+        nadir::DestroySemaphore(m_Semaphore);
     }
-    static void signal(Bikeshed_ReadyCallback* primitive, uint32_t ready_count)
+    static void signal(Bikeshed_ReadyCallback* primitive, uint8_t , uint32_t ready_count)
     {
         NadirLock* _this = (NadirLock*)primitive;
-        if (ready_count > 1)
-        {
-            nadir::WakeAll(_this->m_ConditionVariable);
-        }
-        else if (ready_count > 0)
-        {
-            nadir::WakeOne(_this->m_ConditionVariable);
-        }
+        nadir::PostSemaphore(_this->m_Semaphore, ready_count);
     }
-    nadir::HSpinLock          m_SpinLock;
-    nadir::HNonReentrantLock  m_Lock;
-    nadir::HConditionVariable m_ConditionVariable;
+    nadir::HSemaphore         m_Semaphore;
 };
 
 struct NodeWorker
@@ -142,7 +165,7 @@ struct NodeWorker
     NodeWorker()
         : stop(0)
         , shed(0)
-        , condition_variable(0)
+        , semaphore(0)
         , thread(0)
     {
     }
@@ -151,12 +174,12 @@ struct NodeWorker
     {
     }
 
-    bool CreateThread(Bikeshed in_shed, nadir::HConditionVariable in_condition_variable, uint8_t in_channel_count, nadir::TAtomic32* in_stop)
+    bool CreateThread(Bikeshed in_shed, nadir::HSemaphore in_semaphore, uint8_t in_channel_count, nadir::TAtomic32* in_stop)
     {
         shed               = in_shed;
         stop               = in_stop;
         channel_count      = in_channel_count;
-        condition_variable = in_condition_variable;
+        semaphore          = in_semaphore;
         thread             = nadir::CreateThread(malloc(nadir::GetThreadSize()), NodeWorker::Execute, 0, this);
         return thread != 0;
     }
@@ -185,7 +208,10 @@ struct NodeWorker
             }
             if (*_this->stop == 0)
             {
-                nadir::SleepConditionVariable(_this->condition_variable, 1000);
+                if (!nadir::WaitSemaphore(_this->semaphore))
+                {
+                    break;
+                }
             }
             else
             {
@@ -197,7 +223,7 @@ struct NodeWorker
 
     nadir::TAtomic32*           stop;
     Bikeshed                    shed;
-    nadir::HConditionVariable   condition_variable;
+    nadir::HSemaphore           semaphore;
     nadir::HThread              thread;
     uint8_t                     channel_count;
 };
@@ -436,7 +462,7 @@ static uint64_t GetTicksPerSecond()
 
 int main(int argc, char** argv)
 {
-    NadirLock sync_primitive;
+    NadirLock sync_primitive(524288);
     nadir::TAtomic32 stop = 0;
 
     uint32_t width = 1920u;
@@ -512,7 +538,7 @@ int main(int argc, char** argv)
     NodeWorker* thread_context = new NodeWorker[thread_count];
     for (uint32_t t = 0; t < thread_count; ++t)
     {
-        if (!thread_context[t].CreateThread(shed, sync_primitive.m_ConditionVariable, PRIORITY_LEVELS, &stop))
+        if (!thread_context[t].CreateThread(shed, sync_primitive.m_Semaphore, PRIORITY_LEVELS, &stop))
         {
             printf("Failed to create thread %u", t + 1);
             return -1;
@@ -551,7 +577,7 @@ int main(int argc, char** argv)
     printf("Threads: %u, Jobs submitted: %d. Peak active jobs: %d, Elapsed time: %.3f s\n", thread_count, (int)submitted_work_count, (int)gPeakActiveCount, (float)(elapsed_ms / 1000.f));
 
     nadir::AtomicAdd32(&stop, 1);
-    nadir::WakeAll(sync_primitive.m_ConditionVariable);
+    nadir::PostSemaphore(sync_primitive.m_Semaphore, thread_count);
 
     for (uint32_t t = 0; t < thread_count; ++t)
     {
