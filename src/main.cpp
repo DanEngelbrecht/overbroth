@@ -1,4 +1,5 @@
 #define BIKESHED_IMPLEMENTATION
+#define BIKESHED_L1CACHE_SIZE   64
 #include "../third-party/bikeshed/src/bikeshed.h"
 
 #include "../third-party/nadir/src/nadir.h"
@@ -567,7 +568,9 @@ int main(int argc, char** argv)
         {
             nadir::Sleep(16000);
         }
+        printf("%u ", pc);
     }
+    printf("\n");
 
     uint64_t end_tick = GetTick();
 
